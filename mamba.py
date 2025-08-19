@@ -4,114 +4,295 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-class S4(nn.Module):
-    def __init__(self,channels: int,hidden_state: int = 64,min_delta: float = 1e-3,eps: float = 1e-6,use_hippo:bool=True):
+
+class S4_with_shared_A(nn.Module):
+    def __init__(self,channels: int,hidden_state: int = 64,min_delta: float = 1e-3,
+                max_delta:float=0.1,kernel_max_size:int=1,eps: float = 1e-6,mode:str="Conv_FFT",
+                use_hippo:bool=True,seed=42,persist_cache=True):
         super().__init__()
         D,N = channels,hidden_state
         self.D,self.N = D,N
         self.eps = eps
-        self.min_delta = min_delta
-        
-        #register kernel cache to not compute it every time new
-        self.register_buffer("_cached_kernel",None,persistent=False)
-        self._cached_len=None
+        self.min_delta = torch.tensor(min_delta)
+        self.max_delta = torch.tensor(max_delta)
+        self.seed=seed
+        self.kernel_max_size = kernel_max_size
+        self.mode = mode
 
-        if use_hippo:
-            A = self.hippo_init(N)
-            log_A = torch.log(torch.expm1(-A))
-            self.log_A = nn.Parameter(log_A)
+        if seed:
+            torch.manual_seed(seed)
+
+        self.A = nn.Parameter(torch.empty((N,N)))
+        self.B = nn.Parameter(torch.empty((N,D)))
+        self.C = nn.Parameter(torch.empty((D,N)))
+        self.D = nn.Parameter(torch.ones(D))
+        self.log_delta = nn.Parameter(torch.empty(1,))
+        #init matrices
+        self.reset_matrices()
+        #kernel for convolutional view/training
+        self.K = self.kernel()
+        #buffer for really long sequences and chunk editing
+        self.register_buffer("cache_h_k", torch.zeros(N), persistent=persist_cache)
+
+
+    def reset_matrices(self):
+        nn.init.kaiming_normal_(self.A,nonlinearity="linear") #He init
+        nn.init.normal_(self.B,std=(1.0/self.N)**0.5)
+        nn.init.normal_(self.C,std=1.0)
+        nn.init.ones_(self.D)
+        nn.init.uniform_(self.log_delta,a=torch.log(self.min_delta),b=torch.log(self.max_delta))
+
+
+    def reset_hidden_state(self, batch_size: int | None = None, *, device=None, dtype=None):
+        #reset hidden state after large new sequence
+        device = device or self.A.device
+        dtype = dtype or self.A.dtype
+        if batch_size is None:
+            new = torch.zeros(self.N, device=device, dtype=dtype)
         else:
-            self.log_A = nn.Parameter(-torch.randn(N,N)) #reparametrization for stability
-        self.B = nn.Parameter(torch.randn(D,N)*0.02)
-        self.C = nn.Parameter(torch.randn(D,N)*0.02)
-
-        self.log_delta = nn.Parameter(torch.ones(D))
-        self.skip_D = nn.Parameter(torch.ones(D))
-        self.out = nn.Linear(D,D)
-
-        #trying to avoid going multiple times through the computation graph 
-        for p in (self.log_A, self.B, self.C, self.log_delta):
-            p.register_hook(lambda grad, _self=self: _self._clear_cache())
-
-    def _clear_cache(self):
-        self._cached_kernel = None
-        self._cached_len = None
+            new = torch.zeros(batch_size, self.N, device=device, dtype=dtype)
+        with torch.no_grad():
+            if self.cache_h_k.shape != new.shape:
+                self.cache_h_k = new
+            else:
+                self.cache_h_k.copy_(new)
 
 
-    @staticmethod
-    def hippo_init(N:int):
-        A = torch.zeros((N, N), dtype=torch.float32)
-        #set diag
-        idx = torch.arange(N) 
-        A[idx,idx]= idx.float()+1
-        #set lower triangle
-        i = torch.arange(N, dtype=torch.float32).view(-1, 1)  #(N,)-> (N,1)
-        v = torch.sqrt(2 * i + 1)                             
-        prod = v @ v.T  #(N,N)
-        lower_mask = torch.tril(torch.ones_like(A, dtype=torch.bool), diagonal=-1)
-        A[lower_mask] = prod[lower_mask]
-        return A
+    def skip_connection(self,y,X):
+        if y.dim() == 1:
+            skip = self.D * X
+        else:
+            skip = self.D[:,torch.newaxis] * X
+        return skip
+
+    def propagate_RNN(self,X,reset_hidden_state:bool=True):
+        
+        is_sequence = False
+        if X.dim() == 1:
+            is_sequence = True
+            X = X[torch.newaxis,:] #(D,L)
+
+        L = X.shape[1]
+        discrete_A,discrete_B = self.discretize()
+
+        def propagate_time_step(h_k_1,x_k):
+            h_k =  discrete_A @ h_k_1 + discrete_B @ x_k
+            y_k = self.C @ h_k
+            return h_k,y_k 
+        
+        #propagagate_sequence
+        pred = []
+        hidden_state = self.cache_h_k
+
+        for t in range(X.shape[1]):
+            x_t = X[:,t]
+            hidden_state,y = propagate_time_step(hidden_state,x_t)
+            pred.append(y)
+        x_final = torch.stack(pred,dim=-1)
+        if is_sequence:
+            x_final = x_final.squeeze()
+
+        if reset_hidden_state:
+            self.reset_hidden_state()
+        return x_final
+    
+
+    def propagate_convolution_filter(self,X,use_fourier=True):
+        is_sequence = False
+        if X.dim() == 1:
+            X = X[torch.newaxis,:]
+            is_sequence = True
+        L = X.shape[1]
+        
+        K = self.K # -> (D,D,N)
+
+        assert K.shape[-1] <= L
+
+        if use_fourier:
+            end_size = L+self.kernel_max_size-1
+            X_pad = nn.functional.pad(X,(0,end_size-L)) #needs padding for kernel length
+            K_pad = nn.functional.pad(K,(0,end_size-self.kernel_max_size)) # needs padding for seq length
+            Xd = torch.fft.rfft(X_pad)
+            Kd = torch.fft.rfft(K_pad)
+            prod = torch.einsum('odf,df->of',Kd,Xd)
+            y = torch.fft.irfft(prod,n=end_size)[:,:L]
+        else:
+            K_rev = torch.flip(K,dims=[2])
+            y = nn.functional.conv1d(X,K_rev,bias=None,padding=self.kernel_max_size-1)[:,:L]
+        
+        if is_sequence:
+            y = y.squeeze()
+
+        return y
+    
+
+
+class S4_base(nn.Module):
+    def __init__(self,hidden_state: int = 64,min_delta: float = 1e-3,
+                max_delta:float=0.1,kernel_max_size:int=1,eps: float = 1e-6,mode:str="Conv_FFT",
+                use_hippo:bool=True,seed=42,persist_cache=True):
+        super().__init__()
+        N = hidden_state
+        self.N = N
+        self.eps = eps
+        self.min_delta = torch.tensor(min_delta)
+        self.max_delta = torch.tensor(max_delta)
+        self.seed=seed
+        self.kernel_max_size = kernel_max_size
+        self.mode = mode
+
+        if seed:
+            torch.manual_seed(seed)
+
+        self.A = nn.Parameter(torch.empty((N,N)))
+        self.B = nn.Parameter(torch.empty((N,1)))
+        self.C = nn.Parameter(torch.empty((1,N)))
+        self.D = nn.Parameter(torch.ones(1))
+        self.log_delta = nn.Parameter(torch.empty(1,))
+        #init matrices
+        self.reset_matrices()
+        #kernel for convolutional view/training
+        self.K = self.kernel()
+        #buffer for really long sequences and chunk editing
+        self.register_buffer("cache_h_k", torch.zeros((N,1)), persistent=persist_cache)
+
+
+    def reset_matrices(self):
+        nn.init.kaiming_normal_(self.A,nonlinearity="linear") #He init
+        nn.init.normal_(self.B,std=(1.0/self.N)**0.5)
+        nn.init.normal_(self.C,std=1.0)
+        nn.init.ones_(self.D)
+        nn.init.uniform_(self.log_delta,a=torch.log(self.min_delta),b=torch.log(self.max_delta))
+
+
+    def reset_hidden_state(self, batch_size: int | None = None, *, device=None, dtype=None):
+        #reset hidden state after large new sequence
+        device = device or self.A.device
+        dtype = dtype or self.A.dtype
+        if batch_size is None:
+            new = torch.zeros(self.N, device=device, dtype=dtype)
+        else:
+            new = torch.zeros(batch_size, self.N, device=device, dtype=dtype)
+        with torch.no_grad():
+            if self.cache_h_k.shape != new.shape:
+                self.cache_h_k = new
+            else:
+                self.cache_h_k.copy_(new)
+
+
+    def __call__(self,X):
+        if self.mode=="RNN":
+            y = self.propagate_RNN(X)
+        if self.mode=="Conv":
+            y = self.propagate_convolution_filter(X,use_fourier=False)
+        else:
+            y = self.propagate_convolution_filter(X,use_fourier=True)
+        
+        skip = self.D * X
+
+        return y + skip
 
 
     def discretize(self):
-        # Reconstruct continuous-time A
-        A = nn.functional.softplus(self.log_A) 
-        dt = nn.functional.softplus(self.log_delta) + self.min_delta  # (D,)
-        A_batch = A.unsqueeze(0) * dt.view(-1, 1, 1)                  # (D,N,N)
-        discrete_A = torch.matrix_exp(A_batch)                        # (D,N,N)
-        N = A.shape[0]
-        I = torch.eye(N, device=A.device, dtype=A.dtype)
-        A_reg = A + self.eps * I                                      # (N,N)
-        #discrete_B= A⁻¹(discrete_A-I)B
-        X = torch.linalg.solve(A_reg, self.B.T)                       # (N,D)
-        Xv = X.T.unsqueeze(-1)                                        # (D,N,1)
-        # (D,N,N) @ (D,N,1) -> (D,N,1) -> (D,N)
-        discrete_B = torch.matmul(discrete_A - I, Xv).squeeze(-1) 
-        return discrete_A, discrete_B
+        I = torch.eye(self.N)
+        A1 = I - torch.exp(self.log_delta)*0.5 *self.A
+        A2 = I + torch.exp(self.log_delta)*0.5 *self.A
+        A1_inv = torch.linalg.inv(A1)
+
+        discrete_A = A1_inv @ A2
+        discrete_B = A1_inv @ (torch.exp(self.log_delta) * self.B)
+        return discrete_A,discrete_B
 
 
-    def _kernel(self,L:int,device:torch.device,dtype=torch.dtype):
-        if self._cached_kernel is not None and self._cached_len == L and self._cached_kernel.device==device and self._cached_kernel.dtype==dtype:
-            return self._cached_kernel
-        discrete_A,discrete_B = self.discretize()
-        discrete_A = discrete_A.to(device=device, dtype=dtype)
-        discrete_B = discrete_B.to(device=device, dtype=dtype)
+    def propagate_RNN(self,X,reset_hidden_state:bool=True):
         
-        D,N,_ = discrete_A.shape
-        A_pows = []
-        I = torch.eye(N, device=device, dtype=dtype).expand(D, N, N)
-        A_pows.append(I)
-        for _ in range(1, L):
-            A_pows.append(discrete_A @ A_pows[-1])
-        A_pows = torch.stack(A_pows, dim=0)  # (L,D,N,N)
-        # Multiply: (L,D,N,N) @ (D,N,1) -> (L,D,N,1)
-        Bd_col = discrete_B.unsqueeze(-1)            # (D,N,1)
-        v_all = torch.matmul(A_pows, Bd_col) # (L,D,N,1)
-        # Contract with C: (D,N) · (L,D,N) -> (D,L)
-        k = torch.einsum('dn,ldn->dl', self.C, v_all.squeeze(-1))
-        if self.training:
-            self._cached_kernel, self._cached_len = k, L      # graph-carrying, valid within this step
+        L = len(X)
+        discrete_A,discrete_B = self.discretize()
+
+        def propagate_time_step(h_k_1,x_k):
+            h_k =  discrete_A @ h_k_1 + discrete_B * x_k
+            y_k = self.C @ h_k
+            return h_k,y_k 
+        
+        #propagagate_sequence
+        pred = []
+        hidden_state = self.cache_h_k
+
+        for t in range(L):
+            x_t = X[t]
+            hidden_state,y = propagate_time_step(hidden_state,x_t)
+            pred.append(y)
+        pred = torch.stack(pred).squeeze()
+        
+        if reset_hidden_state:
+            self.reset_hidden_state()
+        return pred
+    
+
+    def kernel(self):
+        discrete_A,discrete_B = self.discretize()
+        kernels = [(self.C @ torch.linalg.matrix_power(discrete_A,l) @ discrete_B) for l in range(self.kernel_max_size)]
+        K = torch.stack(kernels,dim=-1)
+        return K
+
+
+    def propagate_convolution_filter(self,X,use_fourier=True):
+        L = len(X)
+        K = self.K # -> (D,D,N)
+        assert K.shape[-1] <= L
+
+        if use_fourier:
+            end_size = L+self.kernel_max_size-1
+            X_pad = nn.functional.pad(X,(0,end_size-L)) #needs padding for kernel length
+            K_pad = nn.functional.pad(K,(0,end_size-self.kernel_max_size)) # needs padding for seq length
+            Xd = torch.fft.rfft(X_pad)
+            Kd = torch.fft.rfft(K_pad)
+            prod = Kd*Xd
+            y = torch.fft.irfft(prod,n=end_size).squeeze()
         else:
-            self._cached_kernel, self._cached_len = k.detach(), L
-        self._cached_kernel, self._cached_len = k, L
-        return k
+            y = nn.functional.conv1d(X[torch.newaxis,:],K,bias=None,padding=self.kernel_max_size-1).squeeze()
+        
+        return y[:L]
+    
 
+class MultiChannelS4(nn.Module):
+    """
+    Wrap a S4 module into D parallel, indepent channels
+    """
+    def __init__(self, D, *base_args, **base_kwargs):
+        super().__init__()
+        self.D = D
+        # D independent copies (each has its own params)
+        self.channels = nn.ModuleList([S4_base(*base_args, **base_kwargs) for _ in range(self.D)])
 
-    def forward(self, x: torch.Tensor):
-        B, L, D = x.shape
-        if D != self.D:
-            raise ValueError(f"Channel mismatch: got D={D}, expected {self.D}")
+    def forward(self, x):
+        
+        if x.dim() == 1:
+            # (L,)
+            outs = [m(x) for m in self.channels]
+            return torch.stack(outs, dim=0).squeeze()                   
 
-        # get kernel on correct device/dtype
-        k = self._kernel(L, x.device, x.dtype)   # (D, L)
-        x_T = x.transpose(1, 2).contiguous()     # (B, D, L)
-        w = k.flip(-1).unsqueeze(1)              # (D, 1, L)
-        y = nn.functional.conv1d(x_T, w, padding=L-1, groups=D)  # (B, D, 2L-1)
-        y = y[:, :, :L]
-        y = y.transpose(1, 2)                                    # (B, L, D)
+        elif x.dim() == 2:
+            #(D,L)
+            outs = []
+            for d,channel in enumerate(self.channels):
+                out = channel(x[d,:])
+                outs.append(out)
+            return torch.stack(outs, dim=0)
 
-        y = self.out(y + x * self.skip_D)                        # (B, L, D)
-        return y
+        elif x.dim() == 3:
+            # (B, D, L) -> feed channel i to module i
+            B, D, L = x.shape
+            assert D == self.D, f"Expected {self.D} channels, got {D}"
+            outs = []
+            for i, m in enumerate(self.channels):
+                outs.append(torch.stack([m(x[b, i]) for b in range(B)], dim=0))
+            return torch.stack(outs, dim=1)
+
+        else:
+            raise ValueError("x must be (L,), (B, L), or (B, D, L)")
+        
+
 
 
 class S4Regressor(nn.Module):
