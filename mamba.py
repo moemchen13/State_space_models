@@ -6,6 +6,8 @@ import torch.nn as nn
 
 
 class S4_with_shared_A(nn.Module):
+    #TODO: Implement version of model with shared matrix instead of multiple per channel
+    #Advantage less params mixture of signal in latent space possible
     def __init__(self,channels: int,hidden_state: int = 64,min_delta: float = 1e-3,
                 max_delta:float=0.1,kernel_max_size:int=1,eps: float = 1e-6,mode:str="Conv_FFT",
                 use_hippo:bool=True,seed=42,persist_cache=True):
@@ -30,7 +32,7 @@ class S4_with_shared_A(nn.Module):
         #init matrices
         self.reset_matrices()
         #kernel for convolutional view/training
-        self.K = self.kernel()
+        #self.K = self.kernel()
         #buffer for really long sequences and chunk editing
         self.register_buffer("cache_h_k", torch.zeros(N), persistent=persist_cache)
 
@@ -64,6 +66,7 @@ class S4_with_shared_A(nn.Module):
         else:
             skip = self.D[:,torch.newaxis] * X
         return skip
+
 
     def propagate_RNN(self,X,reset_hidden_state:bool=True):
         
@@ -140,6 +143,7 @@ class S4_base(nn.Module):
         self.seed=seed
         self.kernel_max_size = kernel_max_size
         self.mode = mode
+        self.use_hippo = use_hippo
 
         if seed:
             torch.manual_seed(seed)
@@ -151,14 +155,34 @@ class S4_base(nn.Module):
         self.log_delta = nn.Parameter(torch.empty(1,))
         #init matrices
         self.reset_matrices()
-        #kernel for convolutional view/training
-        self.K = self.kernel()
         #buffer for really long sequences and chunk editing
         self.register_buffer("cache_h_k", torch.zeros((N,1)), persistent=persist_cache)
+    
+
+    @property
+    def delta(self):
+        return torch.exp(self.log_delta.clamp(self.min_delta.log(),self.max_delta.log()))
+    
+    
+    @staticmethod
+    def HiPPO_init(tensor):
+        with torch.no_grad():
+            N = tensor.shape[-1]
+            idx = torch.arange(N)
+            init = torch.sqrt(2*idx+1).unsqueeze(1)
+            HiPPO = init @ init.T
+            row, col = torch.triu_indices(HiPPO.size(0), HiPPO.size(1), offset=1)
+            HiPPO[row,col] = 0
+            HiPPO[torch.arange(N),torch.arange(N)] -= idx
+            tensor.copy_(HiPPO)
+        return tensor
 
 
     def reset_matrices(self):
-        nn.init.kaiming_normal_(self.A,nonlinearity="linear") #He init
+        if self.use_hippo:
+            self.HiPPO_init(self.A)
+        else:#He init
+            nn.init.kaiming_normal_(self.A,nonlinearity="linear") 
         nn.init.normal_(self.B,std=(1.0/self.N)**0.5)
         nn.init.normal_(self.C,std=1.0)
         nn.init.ones_(self.D)
@@ -180,10 +204,10 @@ class S4_base(nn.Module):
                 self.cache_h_k.copy_(new)
 
 
-    def __call__(self,X):
+    def forward(self,X):
         if self.mode=="RNN":
             y = self.propagate_RNN(X)
-        if self.mode=="Conv":
+        elif self.mode=="Conv":
             y = self.propagate_convolution_filter(X,use_fourier=False)
         else:
             y = self.propagate_convolution_filter(X,use_fourier=True)
@@ -195,12 +219,13 @@ class S4_base(nn.Module):
 
     def discretize(self):
         I = torch.eye(self.N)
-        A1 = I - torch.exp(self.log_delta)*0.5 *self.A
-        A2 = I + torch.exp(self.log_delta)*0.5 *self.A
-        A1_inv = torch.linalg.inv(A1)
-
-        discrete_A = A1_inv @ A2
-        discrete_B = A1_inv @ (torch.exp(self.log_delta) * self.B)
+        A1 = I - self.delta*0.5 *self.A
+        A2 = I + self.delta*0.5 *self.A
+        #A1_inv = torch.linalg.inv(A1)
+        #discrete_A = A1_inv @ A2
+        #discrete_B = A1_inv @ (self.delta * self.B)
+        discrete_A = torch.linalg.solve(A1,A2)
+        discrete_B = torch.linalg.solve(A1,self.delta*self.B)
         return discrete_A,discrete_B
 
 
@@ -229,35 +254,46 @@ class S4_base(nn.Module):
         return pred
     
 
-    def kernel(self):
+    def kernel(self,kernel_length):
         discrete_A,discrete_B = self.discretize()
-        kernels = [(self.C @ torch.linalg.matrix_power(discrete_A,l) @ discrete_B) for l in range(self.kernel_max_size)]
-        K = torch.stack(kernels,dim=-1)
-        return K
+        ks = []
+        v = discrete_B
+        for _ in range(kernel_length):
+            ks.append(self.C@v)
+            v = discrete_A@v
+        return torch.stack(ks,dim=-1)
 
 
     def propagate_convolution_filter(self,X,use_fourier=True):
-        L = len(X)
-        K = self.K # -> (D,D,N)
-        assert K.shape[-1] <= L
+        X_in = X
+        if X.dim() == 1:
+            X = X.unsqueeze(0)
+        B,L = X.shape
+
+        K = self.kernel(min(L,self.kernel_max_size))
+
+        K_len = K.shape[-1]
+        end_size = L+ K_len -1
+
+        X_pad = nn.functional.pad(X,(0,end_size-L))
+        K_pad = nn.functional.pad(K.squeeze(0),(0,end_size - K_len))
 
         if use_fourier:
-            end_size = L+self.kernel_max_size-1
-            X_pad = nn.functional.pad(X,(0,end_size-L)) #needs padding for kernel length
-            K_pad = nn.functional.pad(K,(0,end_size-self.kernel_max_size)) # needs padding for seq length
-            Xd = torch.fft.rfft(X_pad)
-            Kd = torch.fft.rfft(K_pad)
-            prod = Kd*Xd
-            y = torch.fft.irfft(prod,n=end_size).squeeze()
+            Xd = torch.fft.rfft(X_pad,n=end_size,dim=-1)
+            Kd = torch.fft.rfft(K_pad,n=end_size,dim=-1)
+            Yd = Xd*Kd
+            y = torch.fft.irfft(Yd,n=end_size,dim=-1)[...,:L]
         else:
-            y = nn.functional.conv1d(X[torch.newaxis,:],K,bias=None,padding=self.kernel_max_size-1).squeeze()
-        
-        return y[:L]
+            X3 = X.unsqueeze(1)
+            y = nn.functional.conv1d(X3,K,padding=K_len).squeeze(1)[...,:L]
+
+        return y.squeeze(0) if X_in.dim() == 1 else y
     
 
 class MultiChannelS4(nn.Module):
     """
-    Wrap a S4 module into D parallel, indepent channels
+    Wrap a S4 module into D parallel, indepent channels 
+    This is not the most efficient as we dont parallelize D
     """
     def __init__(self, D, *base_args, **base_kwargs):
         super().__init__()
@@ -269,55 +305,28 @@ class MultiChannelS4(nn.Module):
         
         if x.dim() == 1:
             # (L,)
-            outs = [m(x) for m in self.channels]
-            return torch.stack(outs, dim=0).squeeze()                   
+            X = x.unsqueeze(0).unsqueeze(0) #(B,D,L)
 
         elif x.dim() == 2:
             #(D,L)
-            outs = []
-            for d,channel in enumerate(self.channels):
-                out = channel(x[d,:])
-                outs.append(out)
-            return torch.stack(outs, dim=0)
+            X = x.unsqueeze(0) #(B,D,L)
 
         elif x.dim() == 3:
             # (B, D, L) -> feed channel i to module i
-            B, D, L = x.shape
-            assert D == self.D, f"Expected {self.D} channels, got {D}"
-            outs = []
-            for i, m in enumerate(self.channels):
-                outs.append(torch.stack([m(x[b, i]) for b in range(B)], dim=0))
-            return torch.stack(outs, dim=1)
+            X = x
+        B, D, L = X.shape
 
-        else:
-            raise ValueError("x must be (L,), (B, L), or (B, D, L)")
-        
+        assert D == self.D, f"Expected {self.D} channels, got {D}"
+        y = torch.empty_like(X)
+        for d,channel in enumerate(self.channels):
+            y[:,d,:]= channel(X[:,d,:])
 
+        if x.dim()<2:
+            y = y.squeeze(0)
+        if x.dim()==1:
+            y = y.squeeze(0)
+        return y
 
-
-class S4Regressor(nn.Module):
-    def __init__(self,channels:int = 32,hidden_dim:int=64,depth:int=2,out_dim:int=1,sequence_to_one:bool=False):
-        super().__init__()
-        assert depth>0
-        assert channels>0
-        assert hidden_dim>0
-        self.sequence_to_one = sequence_to_one
-        self.layers = nn.ModuleList([nn.ModuleDict({
-            "s4block":  S4(channels=channels,hidden_state=hidden_dim),
-            "norm":     nn.LayerNorm(channels)
-        })
-        for i in range(depth)])
-        self.head = nn.Linear(channels,out_dim)
-
-    def forward(self,x):
-        for layer in self.layers:
-            residual = x
-            x = layer["s4block"](x)
-            x = layer["norm"](x+residual)
-
-        if self.sequence_to_one:
-            x = x.mean(dim=1)
-        return self.head(x)
 
 
 class MambaBlock:
