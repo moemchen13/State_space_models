@@ -179,14 +179,25 @@ class S4_base(nn.Module):
 
 
     def reset_matrices(self):
+        
         if self.use_hippo:
             self.HiPPO_init(self.A)
         else:#He init
             nn.init.kaiming_normal_(self.A,nonlinearity="linear") 
+
         nn.init.normal_(self.B,std=(1.0/self.N)**0.5)
         nn.init.normal_(self.C,std=1.0)
         nn.init.ones_(self.D)
         nn.init.uniform_(self.log_delta,a=torch.log(self.min_delta),b=torch.log(self.max_delta))
+        
+        with torch.no_grad():
+            I = torch.eye(self.N, device=self.A.device, dtype=self.A.dtype)
+            # scale to avoid huge norms
+            anorm = torch.linalg.matrix_norm(self.A, ord=2)
+            self.A.div_(anorm.clamp_min(1e-6))
+            # shift eigenvalues to Re(λ) < 0
+            self.A.add_(-0.1 * I) 
+        #Hurwitz for numerical stability for high N and L values
 
 
     def reset_hidden_state(self, batch_size: int | None = None, *, device=None, dtype=None):
@@ -218,9 +229,10 @@ class S4_base(nn.Module):
 
 
     def discretize(self):
-        I = torch.eye(self.N)
-        A1 = I - self.delta*0.5 *self.A
-        A2 = I + self.delta*0.5 *self.A
+        I = torch.eye(self.N,device=self.A.device,dtype=self.A.dtype)
+        delta = self.delta.to(device=self.A.device,dtype=self.A.dtype)
+        A1 = I - delta*0.5 *self.A
+        A2 = I + delta*0.5 *self.A
         #A1_inv = torch.linalg.inv(A1)
         #discrete_A = A1_inv @ A2
         #discrete_B = A1_inv @ (self.delta * self.B)
