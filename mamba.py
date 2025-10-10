@@ -227,7 +227,6 @@ class S4_naive(nn.Module):
             y = self.propagate_convolution_filter(X,use_fourier=False)
         else:
             y = self.propagate_convolution_filter(X,use_fourier=True)
-        
         skip = self.D * X
 
         return y + skip
@@ -319,7 +318,7 @@ class S4_fast(S4_naive):
         self.P = nn.Parameter(torch.empty(N,self.r))
 
         self.init_matrices(use_ortho_pq=use_ortho_pq)
-
+        #self.A = self.full_A()
 
     def init_matrices(self,use_ortho_pq:bool):
         #initializing the sparse matrices for A and B,C
@@ -346,7 +345,8 @@ class S4_fast(S4_naive):
         #similar to delta but now with constructed diagonal unitary D matrix
         return -torch.exp(self.theta)+ 1j* self.omega
     
-    def full_A(self):
+    @property
+    def A(self):
         D = torch.diag(self.D_diag.to(self.P.dtype).to(self.P.device))
         Q = self.Q
         if Q.dim>2:
@@ -405,13 +405,13 @@ class S4_fast(S4_naive):
         Kz = torch.einsum('rn,ln->l',C,x) #shape: [L]
         #5)iFFT into time domain kernel K
         K_time = torch.fft.ifft(Kz,n=L).real
-
+        #print(K_time.shape)
         return K_time.view(1,1,L).to(self.B.dtype)
 
 
     def discretize(self):
         #only used for the RNN way therefore dense representation of A
-        A = self.full_A()  # complex
+        A = self.A  # complex
         I = torch.eye(self.N, device=A.device, dtype=A.dtype)
         delta = self.delta.to(device=A.device, dtype=A.dtype)
         A1 = I - delta * 0.5 * A
@@ -425,31 +425,77 @@ class S4_fast(S4_naive):
         return Ad, Bd
 
 
+class S4D(S4_naive):
+    def __init__(self,hidden_state:int=64,fixed_B:bool=True,**kwargs):
+        super().__init__(hidden_state=hidden_state,**kwargs)
+        N = hidden_state
 
-    def propagate_convolution_filter(self,X,use_fourier=True):
-        X_in = X
-        if X.dim() == 1:
-            X = X.unsqueeze(0)
-        B,L = X.shape
+        self.theta = nn.Parameter(torch.empty(N))
+        self.omega = nn.Parameter(torch.empty(N))
+        self.init_diagonal_params()
+        if fixed_B:
+            self.B = nn.Parameter(torch.ones_like(self.B,requires_grad=False))
 
-        K = self.kernel(min(L,self.kernel_max_size))
+    @property
+    def A(self):
+        dtype = torch.complex64 if self.B.dtype == torch.float32 else torch.complex128 
+        return (-torch.exp(self.theta) + 1j*self.omega).to(device=self.B.device,dtype=dtype)
 
-        K_len = K.shape[-1]
-        end_size = L+ K_len -1
 
-        X_pad = nn.functional.pad(X,(0,end_size-L))
-        K_pad = nn.functional.pad(K.squeeze(0),(0,end_size - K_len))
+    def init_diagonal_params(self):
+        with torch.no_grad():
+            N = self.N
+            n = torch.arange(N,dtype=torch.float32,device=self.B.device)
+            self.theta.copy_(torch.log1p(n))
+            self.omega.copy_(torch.linspace(0.0,torch.pi * (1-1.0/(N+1)),N,device=self.B.device))
 
-        if use_fourier:
-            Xd = torch.fft.rfft(X_pad,n=end_size,dim=-1)
-            Kd = torch.fft.rfft(K_pad,n=end_size,dim=-1)
-            Yd = Xd*Kd
-            y = torch.fft.irfft(Yd,n=end_size,dim=-1)[...,:L]
-        else:
-            X3 = X.unsqueeze(1)
-            y = nn.functional.conv1d(X3,K,padding=K_len).squeeze(1)[...,:L]
+            #noise against symmetry
+            self.theta.add_(1e-3 * torch.randn_like(self.theta))
+            self.omega.add_(1e-3 * torch.randn_like(self.omega))
 
-        return y.squeeze(0) if X_in.dim() == 1 else y
+
+    def discretize(self):
+        delta = self.delta.to(device=self.B.device,dtype=self.B.dtype)
+        A = self.A
+        B = self.B.squeeze(-1).to(A.dtype)  #shapes all [N] because diag
+        denom = (1- 0.5*delta.to(A.dtype)*A)
+        Ad = (1+0.5*delta.to(A.dtype)*A)/denom
+        Bd = (delta.to(A.dtype)/denom)*B
+
+        Ad_r = torch.diag(Ad.real)
+        Bd_r = Bd.real.unqueeze(-1)
+        return Ad_r,Bd_r 
+    
+    def kernel(self,L:int):
+        assert L>0
+        device = self.B.device
+        dtypeC = torch.complex64 if self.B.dtype == torch.float32 else torch.complex128
+
+        #1) same as in S4fast
+        k = torch.arange(L, device=device, dtype=self.B.dtype)
+        w = 2 * torch.pi * k / L
+        z = torch.exp(1j * w.to(dtypeC)) #shape: [L]
+        
+        #2)
+        delta = self.delta.to(device=device, dtype=self.B.dtype)
+        s = (2.0 / delta).to(dtypeC) * (z - 1.0) / (z + 1.0) #shape: [L]
+        
+        #3)
+        D = self.D
+        D.to(device=device, dtype=dtypeC) #shape: [N]
+        B = self.B.squeeze(-1).to(device=device, dtype=dtypeC)#shape: [N]
+        C = self.C.squeeze(0).to(device=device, dtype=dtypeC) #shape: [N]
+        
+        #4) simpler than S4_fast because diagonal
+        R = s[:,None]-D[None,:]
+        RB = B[None,:]/R
+        Kz = (RB*C[None,:]).sum(dim=-1)
+        
+        #5)
+        K_time = torch.fft.ifft(Kz,n=L).real
+        return K_time.view(1,1,L).to(self.B.dtype)
+        
+
 
 class MultiChannelS4(nn.Module):
     """
@@ -462,8 +508,12 @@ class MultiChannelS4(nn.Module):
         # D independent copies (each has its own params)
         if implementation=="naive":
             self.channels = nn.ModuleList([S4_naive(*base_args, **base_kwargs) for _ in range(self.n_channels)])
-        else:
+        elif implementation == "fast":
             self.channels = nn.ModuleList([S4_fast(*base_args, **base_kwargs) for _ in range(self.n_channels)])
+        elif implementation == "diagonal":
+            self.channels = nn.ModuleList([S4D(*base_args, **base_kwargs) for _ in range(self.n_channels)])
+        else: 
+            raise NameError(f"No implementation {implementation} found.")
         
 
     def forward(self, x):
