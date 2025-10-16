@@ -638,29 +638,25 @@ class S6(nn.Module):
     
 
     def conv_parallel(self,X:torch.Tensor,x_init:torch.Tensor=None):
-        B,D,L = X.shape
+        B,_,_ = X.shape #(B,L,D)
         device = X.device
         
         u_t = X
-        B_t, C_t, Delta_t = self.context_dependent_params(u_t) #(B,L,N)
+        B_t, C_t, Delta_t = self.context_dependent_params(u_t) 
         #discretize A,B
         dA = torch.exp(self.A*Delta_t)
         denom = self.A+self.eps
         dB = ((dA-1)/denom)*B_t
         
-        #x_init already generated sequence working memory
+        #for long train output necessary
         x = torch.zeros(B,self.N,device=device) if x_init is None else x_init
         conv = torch.cumprod(dA,dim=1)
         ones = torch.ones(B,1,self.N,device=device) 
         C_t = torch.cat([ones,conv[:,:-1,:]],dim=1)
-        #print(f"build convolution kernel {C_t.shape}")
 
         z_t = dB/(C_t+self.eps)
         s_t = torch.cumsum(z_t,dim=1)
         x_init_exp = x.unsqueeze(1)
-        #print(f"x_init_exp: {x_init_exp.shape}")
-        #print(f"conv_pre: {C_t.shape}")
-        #print(f"s_t: {s_t.shape}")
         X_state = C_t * (x_init_exp+s_t) #(B,L,N)
         Y = self.W_out(C_t * X_state)
         return Y,X_state
@@ -670,8 +666,9 @@ class S6(nn.Module):
 class MambaBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int, ffn_multiplier: int = 4,
                  dropout: float = 0.0,**kwargs):
-        """This is a Mamba block with feedfowrad MLP and S6 layer 
-        please ensure canonical format in forward pas of B,D,L"""
+        """This is a Mamba block with feedforward MLP and S6 layer 
+        please ensure to not use the canonical format in forward (B,D,L)
+        use the Transformer like pass of B,L,D."""
         super().__init__()
         self.s6 = S6(d_model, d_state,**kwargs)
         self.dropout = nn.Dropout(dropout)
@@ -686,10 +683,9 @@ class MambaBlock(nn.Module):
         )
 
     def forward(self,x:torch.Tensor):
-
+        #Ensure format of X.shape = (B,L,D)
         y = self.s6(x)
         x = x + self.dropout(y)
-
         z = self.ffn(x)
         x = x + self.dropout(z)
 
@@ -713,6 +709,8 @@ class Mamba(nn.Module):
     
 
     def forward(self,X:torch.tensor):
+        X = self.correct_format(X)
         y = self.layers(X)
+        y = self.correct_format(y)
         return y
 
