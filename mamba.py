@@ -544,12 +544,175 @@ class MultiChannelS4(nn.Module):
 
 
 
-class MambaBlock:
-    def __init__(self,input_dim,hidden_dim,output_dim,use_real):
-        self.delta = torch.tensor((hidden_dim,hidden_dim),dtype=float)
-        self.A = torch.tensor((hidden_dim,hidden_dim),dtype=float)
-        self.B = torch.tensor((hidden_dim,1),dtype=float)
-        self.C = torch.tensor((1,hidden_dim),dtype=float)
+class S6(nn.Module):
+    def __init__(self,input_dim:int,hidden_dim:int,eps:float=1e-6,**kwargs):
+        super().__init__()
+        D = input_dim
+        N = hidden_dim
+        self.N = N
+        self.eps = eps
 
-    def forward(input):
-        pass
+        self.A_log = nn.Parameter(torch.empty(N,))
+
+        self.to_B = nn.Linear(D,N,bias=True)
+        self.to_C = nn.Linear(D,N,bias=True)
+        self.to_delta = nn.Linear(D,1,bias=True)
+
+        self.W_out = nn.Linear(N,D,bias=True)
+
+    
+
+    @property
+    def A(self):
+        return -torch.nn.functional.softplus(self.A_log)
+
+    def init_matrices(self):
+        #does the He initialization make sense here?
+        nn.init.kaiming_normal_(self.A_log,nonlinearity="linear")
+
+    def forward(self,input):
+        y_t,x = self.conv_parallel(input)
+        return y_t
+    
+
+    def context_dependent_params(self,u):
+        B_t = self.to_B(u)
+        C_t = self.to_C(u)
+        Delta_t = torch.nn.functional.softplus(self.to_delta(u))
+        
+        return B_t,C_t,Delta_t
+
+
+    def recurrent_one_step(self,X:torch.tensor,x_init:torch.tensor=None):
+        B,D,L = X.shape
+        device = X.device
+        #init_state
+        x = torch.zeros(B,self.N,device=device) if x_init is None else x_init
+        
+        u_t = X[:,:,-1]
+        B_t, C_t, Delta_t =self.context_dependent_params(u_t)
+        
+        #discretize A,B
+        dA = torch.exp(self.A*Delta_t)
+        denom = self.A+self.eps
+        dB = ((dA-1)/denom)*B_t
+
+        #new_state
+        x = dA*x + dB
+        
+        y_t = self.W_out(C_t * x)
+        return y_t,x
+
+
+    def recurrent_multi_step(self,X:torch.tensor,L:int,x_init:torch.Tensor=None):
+        B,D,L = X.shape
+        device = X.device
+        
+        #optional normalize
+        #X = nn.LayerNorm(D)(X)
+        
+        #init_state
+        x = torch.zeros(B,self.N,device=device) if x_init is None else x_init
+        #prep out
+        Y = torch.empty(B,L,D,device=device)
+        
+        for t in range(L):
+            u_t = X[:,:,t] #B,N
+
+            B_t, C_t, Delta_t = self.context_dependent_params(u_t)
+
+            #discretize A,B
+            dA = torch.exp(self.A*Delta_t)
+            denom = self.A+self.eps
+            dB = ((dA-1)/denom)*B_t
+
+            #new_state
+            x = dA*x + dB 
+            y_t = self.W_out(C_t * x)
+            Y[:,t,:] = y_t
+
+        Y = nn.LayerNorm(D)(Y)
+
+        return Y,X
+    
+    
+
+    def conv_parallel(self,X:torch.Tensor,x_init:torch.Tensor=None):
+        B,D,L = X.shape
+        device = X.device
+        
+        u_t = X
+        B_t, C_t, Delta_t = self.context_dependent_params(u_t) #(B,L,N)
+        #discretize A,B
+        dA = torch.exp(self.A*Delta_t)
+        denom = self.A+self.eps
+        dB = ((dA-1)/denom)*B_t
+        
+        #x_init already generated sequence working memory
+        x = torch.zeros(B,self.N,device=device) if x_init is None else x_init
+        conv = torch.cumprod(dA,dim=1)
+        ones = torch.ones(B,1,self.N,device=device) 
+        C_t = torch.cat([ones,conv[:,:-1,:]],dim=1)
+        #print(f"build convolution kernel {C_t.shape}")
+
+        z_t = dB/(C_t+self.eps)
+        s_t = torch.cumsum(z_t,dim=1)
+        x_init_exp = x.unsqueeze(1)
+        #print(f"x_init_exp: {x_init_exp.shape}")
+        #print(f"conv_pre: {C_t.shape}")
+        #print(f"s_t: {s_t.shape}")
+        X_state = C_t * (x_init_exp+s_t) #(B,L,N)
+        Y = self.W_out(C_t * X_state)
+        return Y,X_state
+
+
+
+class MambaBlock(nn.Module):
+    def __init__(self, d_model: int, d_state: int, ffn_multiplier: int = 4,
+                 dropout: float = 0.0,**kwargs):
+        """This is a Mamba block with feedfowrad MLP and S6 layer 
+        please ensure canonical format in forward pas of B,D,L"""
+        super().__init__()
+        self.s6 = S6(d_model, d_state,**kwargs)
+        self.dropout = nn.Dropout(dropout)
+
+        hidden = ffn_multiplier * d_model
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self,x:torch.Tensor):
+
+        y = self.s6(x)
+        x = x + self.dropout(y)
+
+        z = self.ffn(x)
+        x = x + self.dropout(z)
+
+
+        return x
+    
+
+class Mamba(nn.Module):
+    def __init__(self, n_layers,canonical_format:bool=True, *base_args, **base_kwargs):
+        super().__init__()
+        self.n_layers = n_layers
+        self.canonical_format = canonical_format
+        self.layers = nn.Sequential(*[MambaBlock(*base_args, **base_kwargs) for _ in range(self.n_layers)])
+        
+
+    def correct_format(self,X):
+        if self.canonical_format:
+            #B,D,L -> B,L,D
+            X = X.permute(0,2,1)
+        return X
+    
+
+    def forward(self,X:torch.tensor):
+        y = self.layers(X)
+        return y
+
